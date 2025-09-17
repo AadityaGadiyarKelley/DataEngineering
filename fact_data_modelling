@@ -1,0 +1,215 @@
+-- 1
+with deduped as(
+
+    select g.game_date_est,
+        gd.*,
+       row_number() over (partition by gd.game_id, team_id, player_id order by g.game_date_est) as row_num
+    from game_details gd
+    join games g on gd.game_id = g.game_id
+)
+select * from deduped where row_num = 1;
+
+-- 2 and 3
+INSERT INTO user_devices_cumulated
+with yesterday as (
+    select *
+    from user_devices_cumulated
+    where updated_at::date = DATE('2022-01-30')
+),
+    today as (
+        select CAST(e.user_id AS TEXT) as user_id,
+               d.browser_type as browser_type,
+               DATE_TRUNC('day', event_time::timestamp) AS date_active
+        from devices d
+        join events e on d.device_id = e.device_id
+        where  DATE_TRUNC('day', event_time::timestamp) = DATE('2023-01-31') and user_id IS NOT NULL
+        GROUP BY e.user_id, d.browser_type, DATE_TRUNC('day', event_time::timestamp)
+    )
+
+SELECT
+    user_id,
+    jsonb_object_agg(browser_type, dates) AS device_activity_datelist,
+    NOW() AS updated_at
+FROM (
+    SELECT
+        COALESCE(y.user_id, t.user_id) AS user_id,
+        t.browser_type,
+        CASE
+            WHEN y.device_activity_datelist IS NULL
+                THEN jsonb_build_array(t.date_active)
+            WHEN t.date_active IS NULL
+                THEN y.device_activity_datelist -> t.browser_type
+            WHEN (y.device_activity_datelist ? t.browser_type)
+                THEN to_jsonb(t.date_active) || (y.device_activity_datelist -> t.browser_type)
+            ELSE jsonb_build_array(t.date_active)
+        END AS dates
+    FROM today t
+    FULL OUTER JOIN yesterday y
+    ON t.user_id = y.user_id
+) sub
+GROUP BY user_id
+ON CONFLICT (user_id)
+DO UPDATE SET
+    device_activity_datelist = EXCLUDED.device_activity_datelist,
+    updated_at = EXCLUDED.updated_at;
+
+
+
+CREATE TABLE user_devices_cumulated (
+    user_id TEXT NOT NULL,
+    device_activity_datelist JSONB NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id)
+);
+
+
+
+--4
+WITH expanded AS (
+    SELECT
+        u.user_id,
+        (jsonb_array_elements_text(value))::date AS active_date
+    FROM user_devices_cumulated u,
+         jsonb_each(u.device_activity_datelist)  -- expand browser keys
+),
+    days as (
+        select * from
+            generate_series(DATE('2023-01-01'), DATE('2023-01-31'), INTERVAL '1 day') AS valid_date
+    ),
+
+    starter as (
+        SELECT
+        u.user_id,
+        d.valid_date,
+        -- true if user has this day in expanded JSONB
+        EXISTS (
+            SELECT 1
+            FROM expanded e
+            WHERE e.user_id = u.user_id
+              AND e.active_date::date = d.valid_date::date
+        ) AS is_active,
+        -- how many days since anchor (2023-03-31)
+        EXTRACT(DAY FROM DATE '2023-01-31' - d.valid_date) AS days_since
+    FROM (SELECT DISTINCT user_id FROM expanded) u
+    CROSS JOIN days d
+    ),
+
+    bits AS (
+    SELECT
+        user_id,
+        SUM(
+            CASE
+                WHEN is_active
+                THEN POW(2, 31 - days_since) -- left-shift bit
+                ELSE 0
+            END
+        )::bigint::bit(31) AS datelist_int
+    FROM starter
+    GROUP BY user_id
+)
+INSERT INTO user_datelist_int (user_id, datelist_int, snapshot_date)
+SELECT user_id, datelist_int, DATE '2023-01-31'
+FROM bits;
+
+CREATE TABLE user_datelist_int (
+    user_id TEXT NOT NULL,
+    datelist_int BIT(31) NOT NULL,   -- the 32-bit activity mask
+    snapshot_date DATE NOT NULL,     -- the anchor date (end of window)
+    PRIMARY KEY (user_id, snapshot_date)
+);
+
+--5
+create table hosts_cumulated(
+    host TEXT,
+    host_activity_datelist DATE[],
+    updated_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY(host)
+);
+
+--6
+INSERT INTO  hosts_cumulated
+with yesterday as (
+    select *
+    from hosts_cumulated
+    where CAST(updated_at AS DATE) = DATE('2022-12-31')
+),
+    today as (
+        select host,
+               ARRAY_AGG(DISTINCT CAST(event_time AS DATE)) as new_dates
+        from events
+        where CAST(event_time AS DATE) = DATE('2023-01-01')
+        group by host
+    )
+    select
+        COALESCE(y.host, t.host),
+        CASE
+            WHEN y.host_activity_datelist IS NULL THEN t.new_dates
+            WHEN t.new_dates IS NULL then y.host_activity_datelist
+            ELSE y.host_activity_datelist || t.new_dates
+        END AS host_activity_datelist,
+        now() as updated_at
+
+        from yesterday y
+        full outer join today t
+        on y.host=t.host
+ON CONFLICT (host)
+DO UPDATE SET
+    host_activity_datelist = EXCLUDED.host_activity_datelist,
+    updated_at = EXCLUDED.updated_at;
+;
+
+--7
+create table host_activity_reduced(
+     month DATE NOT NULL,
+    host TEXT NOT NULL,
+    hit_array INTEGER[] NOT NULL,
+    unique_visitors_array INTEGER[] NOT NULL,
+    PRIMARY KEY (month, host)
+);
+
+--8
+INSERT INTO host_activity_reduced
+with daily_aggregate AS (
+    select host,
+            CAST(event_time AS DATE) AS date,
+           count(1) as num_hits,
+           count(DISTINCT user_id) as distinct_user
+        from events
+        where CAST(event_time AS DATE) = DATE('2023-01-01')
+        group by host, CAST(event_time AS DATE)
+),
+    yesterday_array as (
+        select *
+        from host_activity_reduced
+        where month = DATE('2023-01-01')
+    )
+    select
+        COALESCE(ya.month, date_trunc('month', da.date)) AS month_start,
+        COALESCE(da.host, ya.host) as host,
+        CASE
+            WHEN ya.hit_array IS NOT NULL THEN ya.hit_array || ARRAY[COALESCE(da.num_hits,0)]
+            WHEN ya.month IS NULL THEN ARRAY[COALESCE(da.num_hits,0)]
+            WHEN ya.hit_array IS NULL
+                then ARRAY_FILL(0, ARRAY[COALESCE(date - DATE(DATE_TRUNC('month', date)),0)]) || ARRAY[COALESCE(da.num_hits,0)]
+    END AS hit_array,
+        CASE
+            WHEN ya.unique_visitors_array IS NOT NULL
+                THEN ya.unique_visitors_array || ARRAY[COALESCE(da.distinct_user,0)]
+            WHEN ya.month IS NULL
+                THEN ARRAY[COALESCE(da.distinct_user,0)]
+            WHEN ya.unique_visitors_array IS NULL
+                THEN ARRAY_FILL(0, ARRAY[COALESCE(date - DATE(DATE_TRUNC('month', date)),0)])
+                     || ARRAY[COALESCE(da.distinct_user,0)]
+    END AS unique_visitors_array
+
+
+    from daily_aggregate da FULL OUTER JOIN yesterday_array ya
+    on da.host = ya.host
+
+    ON CONFLICT (month, host)
+    DO UPDATE SET
+    hit_array = EXCLUDED.hit_array,
+    unique_visitors_array = EXCLUDED.unique_visitors_array;
+
+
+--drop table host_activity_reduced;
