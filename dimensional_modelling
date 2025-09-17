@@ -1,0 +1,205 @@
+create type films as (
+    film TEXT,
+    votes INTEGER,
+    rating REAL,
+    filmid TEXT
+                     );
+
+create type quality_class as ENUM('star', 'good', 'average', 'bad');
+
+create table actors(
+    actor TEXT,
+    films films[],
+    quality_class quality_class,
+    is_active BOOLEAN,
+    current_year INTEGER,
+    primary key (actor, current_year)
+);
+--
+drop table actors;
+-- select min(year) from actor_films;
+
+select * from actor_films LIMIT 50;
+
+WITH yesterday AS (
+    SELECT *
+    FROM actors
+    WHERE current_year = 1972
+),
+today AS (
+    SELECT
+        actor,
+        ARRAY_AGG(
+            ROW(film, votes, rating, filmid)::films
+        ) AS films,
+        AVG(rating) AS avg_rating,
+        year AS current_year
+    FROM actor_films
+    WHERE year = 1973
+    GROUP BY actor, year
+)
+INSERT INTO actors
+SELECT
+    COALESCE(y.actor, t.actor) AS actor,
+    CASE
+        WHEN y.films IS NULL THEN t.films
+        WHEN t.films IS NOT NULL THEN y.films || t.films
+        ELSE y.films
+    END AS films,
+    CASE
+        WHEN t.avg_rating > 8 THEN 'star'
+        WHEN t.avg_rating > 7 THEN 'good'
+        WHEN t.avg_rating > 6 THEN 'average'
+        ELSE 'bad'
+    END::quality_class,                  -- cast to enum
+    (t.current_year IS NOT NULL) AS is_active,
+    COALESCE(t.current_year, y.current_year + 1) AS current_year
+FROM yesterday y
+FULL OUTER JOIN today t
+  ON y.actor = t.actor;
+
+create type scd_type as (
+    quality_class quality_class,
+    is_active BOOLEAN,
+    start_date INTEGER,
+    end_date INTEGER
+                );
+
+create table actors_history_scd (
+    actor TEXT,
+    start_date INTEGER,
+    end_date INTEGER,
+    current_year INTEGER,
+    quality_class quality_class,
+    is_active BOOLEAN,
+    PRIMARY KEY (actor, start_date)
+);
+
+drop table actors_history_scd;
+
+insert into actors_history_scd
+with with_previous as (
+    select
+        actor,
+        current_year,
+        quality_class,
+        LAG(quality_class,1) OVER (PARTITION BY actor ORDER BY current_year) AS previous_quality_class,
+        is_active,
+        LAG(is_active,1) OVER (PARTITION BY  actor order by current_year) AS previous_is_active
+    from actors
+    where current_year<=1971
+
+),
+    with_indicators AS (
+        select * ,
+           CASE
+               WHEN quality_class <> previous_quality_class THEN 1
+               WHEN is_active <> previous_is_active THEN 1
+               ELSE 0
+            END AS change_indicator
+
+from with_previous
+    )
+,streaks as (
+    select *,
+    SUM(change_indicator) OVER (PARTITION BY actor ORDER BY current_year) as streak_identifier
+    from with_indicators
+)
+    select
+    actor,
+    MIN(current_year) AS start_date,
+    MAX(current_year) AS end_date,
+    1971 AS current_year,
+    quality_class,
+    is_active
+
+    from streaks
+    group by actor, streak_identifier, is_active, quality_class
+    order by actor, streak_identifier;
+
+with last_season_scd as (
+    select * from actors_history_scd
+    where current_year = 1971
+    and end_date =1971
+),
+    historical_season_scd as (
+    select actor,
+           quality_class,
+           is_active,
+           start_date,
+           end_date
+        from actors_history_scd
+    where current_year = 1971
+    and end_date <1971
+        ),
+
+this_season_scd as (
+    select * from actors
+    where current_year = 1972
+),
+    unchanged_records AS (
+        select ts.actor,
+       ts.quality_class, ts.is_active,
+       ls.start_date, ts.current_year as end_date
+        from this_season_scd ts
+        join last_season_scd ls on ts.actor = ls.actor
+        where ts.quality_class = ls.quality_class AND
+              ts.is_active = ls.is_active
+    ),
+
+    changed_records AS (
+         select ts.actor,
+
+         UNNEST(ARRAY[
+            ROW(
+                ls.quality_class,
+                ls.is_active,
+                ls.start_date,
+                ls.current_year
+                )::scd_type,
+             ROW(
+                 ts.quality_class,
+                ts.is_active,
+                ts.current_year,
+                ts.current_year
+                 )::scd_type
+         ]) as records
+        from this_season_scd ts
+        join last_season_scd ls on ts.actor = ls.actor
+        where ts.quality_class <> ls.quality_class OR
+              ts.is_active <> ls.is_active
+    ),
+    unnested_changed_records as (
+        select actor,
+               (records::scd_type).quality_class,
+               (records::scd_type).is_active,
+               (records::scd_type).start_date,
+               (records::scd_type).end_date
+               from changed_records
+    ),
+
+    new_records as (
+        select ts.actor,
+               ts.quality_class,
+               ts.is_active,
+               ts.current_year as start_date,
+               ts.current_year as end_date
+        from this_season_scd ts
+        left join last_season_scd ls on ts.actor = ls.actor
+        where ls.actor IS NULL
+
+    )
+
+select * from historical_season_scd
+
+UNION ALL
+
+select * from unchanged_records
+
+UNION ALL
+
+select * from unnested_changed_records
+
+UNION ALL
+
+select * from new_records;
